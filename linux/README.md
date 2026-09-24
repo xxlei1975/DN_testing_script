@@ -22,7 +22,7 @@ dig @<DNS服务器IP> <域名> +short
 | `run_dns_test.sh` | 一键运行：缺 Python / 依赖 / dig 时会自动调用 `scripts/setup_env.sh` 装上 |
 | `scripts/setup_env.sh` | 环境自动部署脚本（apt / dnf / yum / apk / zypper / pacman 自动识别），可单独运行 |
 | `tests/test_domain_dns_test.py` | 单元测试（unittest，87 个用例） |
-| `tests/verify_result.py` | 结果文件校验脚本（列格式、逐行对应、改善列、表尾统计重算比对） |
+| `tests/verify_result.py` | 结果文件校验脚本（列格式、域名块对应、改善列、表尾统计重算比对；两种格式都支持） |
 | `tests/list_duplicate_domains.py` | 列出「域名」列中的重复域名及其行号/来源 |
 | `tests/remove_duplicate_domains.py` | 删除重复域名的后续出现行（默认只演练，`--apply` 才写入并自动备份） |
 | `requirements.txt` | 依赖清单（openpyxl、requests） |
@@ -120,6 +120,10 @@ sudo sysctl -w net.ipv4.ping_group_range='0 2147483647'  # 放开 ICMP socket �
 | `--no-ping-cache` | 不使用 ping 结果缓存（每次都真实测试） |
 | `--no-ping-retry` | 丢包率不为 0% 时不重测（默认会重测一次并按第二次结果记录） |
 | `--no-autofit-row-height` | 不按内容自动调整行高（默认会自动调整） |
+| `--no-local-dns-rewrite` | 不把「DNS 块填的是本机公网 IP」自动改写成 `127.0.0.1` 查询（默认会自动改写） |
+| `--local-ip IP` | 手动指定本机出口公网 IP（跳过自动探测） |
+| `--split-ip-rows` | 每个 IP 占一行：解析出多个 IP 时按 IP 数拆行（见第 4 节），**默认开启** |
+| `--no-split-ip-rows` | 关闭拆行，恢复成「一个域名一行」（每格多行、靠换行对齐） |
 | `--keep-duplicates` | 保留重复域名行（默认自动删除多余行并备份） |
 | `--force-stats` | 配合 `--limit` 使用时也写入表尾统计 |
 
@@ -176,27 +180,59 @@ I7: CU          ← 首IP归属（只看第一个 IP）
 - 含中文的域名会自动转成 punycode 后再查询。
 - 表内重复域名只保留第一次出现，多余的行会被自动删除（见第 8 节）。
 - **两个块即使配了同一个 DNS 服务器 IP，也各自独立写入与统计**（不会互相覆盖）。
+- **DNS 块填的是本机自己的公网 IP 时**，程序会自动改用 `127.0.0.1` 去执行 dig
+  （云主机通常无法用自身公网 IP 回环访问自己，直接查会超时）；
+  **结果表里的 DNS 服务器 IP 保持原样不变**。想关掉用 `--no-local-dns-rewrite`，
+  或手动指定本机公网 IP：`--local-ip <IP>`。
+- **默认是「每个 IP 一行」（`--split-ip-rows`）**：把解析出多个 IP 的域名拆成多行：
+  - **每域一列**（序号 / 域名等前置列 、CNAME、首IP归属、时延改善、丢包改善）
+    纵向**合并**成一块，值写在合并区首行；
+  - **每个 IP 一列**（A / IP归属 / 时延 / 丢包率）逐行写入，行数不足时留空。
+  - 三个块的 IP 数不同时按**最大值**拆行（例如 5/5/20 就拆 20 行，前两块后 15 行空白）。
+  - 这样每格只有一个 IP 的归属文字，不靠换行对齐；归属列不开自动换行，
+    长文字保持原列宽、超出的部分被裁切。
+  - ⚠️ **表尾统计仍按「域名」口径计算**（一个域名的多行算一行），11 项含义不变；
+    统计区会随插入的行整体下移。
+  - ⚠️ 行数会明显变多（实测 20 个域名 -> 139 行；全量 175 个域名预计 1000+ 行）。
+    `tests/verify_result.py` 已支持两种格式（按「域名块」统计），可直接校验。
+- 用 **`--no-split-ip-rows`** 可切回「一个域名一行」：此时 `IP归属` / `首IP归属` 列
+  每个 IP 占一行（靠单元格里的显式换行，必须保持「自动换行」开启，
+  Excel 才会渲染成多行）；这两列只按**显式换行**参与行高估算，
+  很长的运营商文字不会把行高撞高，列宽也保持不变（见第 5.4 节）。
 
 ## 5. 运营商简化 / ping / 改善值
 
 ### 5.1 运营商简化（写入 `IP归属`、`首IP归属`）
 
+判定范围是 ip-api 返回的 **`isp`、`org`、`as`、`asname` 四个字段**：
+按 `isp` → `org` → `as` → `asname` 的顺序依次检查，**任意一个**字段包含下表关键字
+就简化成 `CT` / `CU` / `CM`（取第一个命中的）。
 不区分大小写，先把文字里的空白与标点去掉再做包含判断：
 
-| ip-api 返回的运营商文字中包含 | 写入 |
+| 上述四个字段中任一字段包含 | 写入 |
 | --- | --- |
 | `chinanet`、`china telecom`、`wanbao` | `CT` |
 | `china unicom`、`china169` | `CU` |
 | `china mobile communications corporation`、`china mobile communications group` | `CM` |
-| 其他文字（如 `Hangzhou Alibaba Advertising Co`） | 原样保留 |
-| 查询失败 / 运营商文字为空 | `未知` |
+| 四个字段都不含（如 `Hangzhou Alibaba Advertising Co`） | 原样写 `isp` 字段的文字 |
+| 查询失败 / `isp` 为空 | `未知` |
 
-- 简化只影响写入，`cache/ip_info_cache.json` 里仍保存 ip-api 的原始文字。
+- 之所以要看四个字段：ip-api 的 `isp` 字段偶发脏值，会把城市名当运营商返回
+  （实测出现过 `Jinan,` / `Qingdao,`，且字段之间还会串），
+  但同一条响应里的 `org`（`Chinanet SD`）与 `as` / `asname`
+  （`AS58540 CHINATELECOM SHANDONG JINAN IDC`）是正确的 —— 只看 `isp` 会把这类
+  电信 IP 误判成「非三大运营商」。
+- 四个字段都没命中时**仍写 `isp` 原文**（与旧版行为一致）；简化只影响写入，
+  `cache/ip_info_cache.json` 里保存四个字段的原始文字。
 - `China Mobile Hong Kong Company Limited`（CMHK）不在 CM 规则内，会原样保留；
   如果也要算 CM，改 `ISP_SIMPLIFY_RULES` 一行即可。
+- **升级提示**：旧版缓存的记录没有 `org`/`as`/`asname` 三个字段，升级后请删除
+  `cache/ip_info_cache.json`（或加 `--no-ip-cache` 运行），
+  否则这些 IP 会走缓存命中、继续沿用旧结果，看起来像「改了没生效」。
 
-归属地数据来自 <https://ip-api.com/>（免费版，字段 `status,country,regionName,city,isp`，
-语言 `zh-CN`）：批量接口 15 次/分钟（每次最多 100 个 IP），单条 45 次/分钟，**只支持 HTTP**；
+归属地数据来自 <https://ip-api.com/>（免费版，字段
+`status,country,regionName,city,isp,org,as,asname`，语言 `zh-CN`）：
+批量接口 15 次/分钟（每次最多 100 个 IP），单条 45 次/分钟，**只支持 HTTP**；
 程序内置限速与重试，批量失败会自动降级为单条查询，结果缓存到 `cache/ip_info_cache.json`。
 
 ### 5.2 ping 测试（写入 `时延`、`丢包率`）
@@ -231,6 +267,8 @@ I7: CU          ← 首IP归属（只看第一个 IP）
   使单元格里的多行内容（多个 IP / 多个归属 / 多行时延）不需手工拖动就能完整显示。
 - 估算方式：按列宽把文本换行后的总行数 × 15 磅 + 2 磅留白（全角字符按 2 个半角宽计），
   上限为 Excel 允许的 409 磅。
+  **`IP归属` / `首IP归属` 列只按单元格里的显式换行计数**（不按列宽折算），
+  所以很长的运营商文字不会把行高撞高，列宽也保持不变。
 - 想保留自己的行高设置：加 `--no-autofit-row-height`。
 
 ## 6. 表尾统计
@@ -255,20 +293,26 @@ I7: CU          ← 首IP归属（只看第一个 IP）
 
 ```bash
 cd linux
-.venv/bin/python -m unittest discover -s tests     # 87 个用例
+.venv/bin/python -m unittest discover -s tests     # 100 个用例
 .venv/bin/python tests/verify_result.py 非洲域名测试列表_result.xlsx
 ```
 
 单元测试覆盖：`dig +short` 输出解析（CNAME/IP/诊断行/IPv6/去重）、失败原因分类、
-dig 路径查找、表结构自动探测（真实表 + 合成表）、运营商文字简化、
-ping 输出解析（Linux iputils / BusyBox / Windows 中英文 / 全丢包 / 部分丢包 / 退回逐包求平均）、
-Linux ping 命令拼装（`-W` 秒换算、`-i` 间隔）、ping 失败原因提示（权限/不可达）、
-丢包重测策略、ping 缓存（含报文数校验）、统计分类与加和关系、时延改善计算、
-行高自适应、重复域名删除与备份、单元格写入、命令行参数解析。
+dig 路径查找、表结构自动探测（真实表 + 合成表）、运营商文字简化（含 `isp`/`org`/`as`/`asname`
+四字段判定）、本机公网 IP 改写、ping 输出解析（Linux iputils / BusyBox / Windows 中英文 /
+全丢包 / 部分丢包 / 退回逐包求平均）、Linux ping 命令拼装（`-W` 秒换算、`-i` 间隔）、
+ping 失败原因提示（权限/不可达）、丢包重测策略、ping 缓存（含报文数校验）、
+统计分类与加和关系、时延改善计算、行高自适应、**每个 IP 一行的拆行与域名块分组**、
+重复域名删除与备份、单元格写入、命令行参数解析。
 
-校验脚本会重新读取结果文件并独立复核：A 列必须是纯 IP、IP归属/时延/丢包率必须与 A 列
-逐行对应且格式正确、首IP归属必须等于 IP归属的第一行、改善列只在首IP归属为 CM 的行出现、
-**表尾统计与按表内实际内容重算的结果完全一致**、重复域名为 0、表头与 DNS 服务器 IP 行未被改动。
+校验脚本会重新读取结果文件并独立复核（**两种写入格式都支持**）：A 列必须是纯 IP、
+IP归属/时延/丢包率必须与 A 列的 IP 一一对应且格式正确、首IP归属必须等于该域名块的
+第一个归属、改善列只在首IP归属为 CM 的域名块出现、**表尾统计与按表内实际内容重算的结果
+完全一致**、重复域名为 0、表头与 DNS 服务器 IP 行未被改动。
+
+> 校验脚本按**域名块**统计：拆行格式下同一个域名的多行会合并成一个块来算，口径与程序一致；
+> 用 `--limit` 试跑时，数据区末尾没处理到的空白域名块会自动排除
+> （否则「无效解析行数」会虚高）。
 
 ## 8. 重复域名处理
 

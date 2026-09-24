@@ -49,7 +49,7 @@ import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -112,13 +112,21 @@ DEFAULT_COLUMN_WIDTH = 8.43         # 未显式设置列宽时 Excel 的默认�
 
 IP_API_BATCH_URL = "http://ip-api.com/batch"
 IP_API_SINGLE_URL = "http://ip-api.com/json/{ip}"
-IP_API_FIELDS = "status,message,country,regionName,city,isp,org,as,query"
+# 运营商判定要用 isp / org / as / asname 四个字段，所以四个都请求
+IP_API_FIELDS = "status,message,country,regionName,city,isp,org,as,asname,query"
 IP_API_LANG = "zh-CN"               # 归属地/城市使用中文
 IP_API_BATCH_SIZE = 100             # 批量接口单次最多 100 个 IP
 IP_API_BATCH_INTERVAL = 4.5         # 批量接口限速：15 次/分钟
 IP_API_SINGLE_INTERVAL = 1.4        # 单条接口限速：45 次/分钟
 IP_API_TIMEOUT = 15                 # 网络超时（秒）
 IP_API_RETRIES = 2                  # 失败重试次数
+
+# 「DNS 服务器填的是本机自己的公网 IP」时的处理：改用回环地址查询。
+# 云主机（如 AWS EC2）通常无法用自身公网 IP 回环访问自己（安全组未放行 + 无 hairpin
+# NAT），直接 dig 只会超时；改用 127.0.0.1 就能正常查询本机正在跑的 DNS 服务。
+LOCAL_DNS_LOOPBACK = "127.0.0.1"
+LOCAL_IP_URLS = ("http://ip-api.com/json/?fields=query", "http://api.ipify.org")
+LOCAL_IP_TIMEOUT = 8                # 探测本机出口公网 IP 的超时（秒）
 
 # 运营商文字简化规则：先把文字归一化（去空白/标点 + 转小写），再做包含判断
 UNKNOWN_ISP_TEXT = "未知"
@@ -174,6 +182,15 @@ class DnsTarget:
     first_ip_attr_col: Optional[int] = None
     latency_improve_col: Optional[int] = None
     loss_improve_col: Optional[int] = None
+    # 真正用于 `dig @<地址>` 的地址。默认与 ip 相同；当这个 IP 就是本机自己的
+    # 公网 IP 时会被改写成 127.0.0.1（见 rewrite_local_dns_targets），
+    # 表格里的 DNS 服务器 IP 始终保留原样。
+    query_ip: str = ""
+
+    @property
+    def resolver_address(self) -> str:
+        """执行 dig 时使用的 DNS 服务器地址。"""
+        return self.query_ip or self.ip
 
     @property
     def label(self) -> str:
@@ -230,11 +247,18 @@ class IpInfo:
     region: str = ""
     city: str = ""
     isp: str = ""
+    # 下面三个字段只参与运营商判定，不会直接写进表格
+    # （表格里写的是四个字段简化后的结果；没命中时仍写 isp 原文）。
+    # 注意：ip-api 的 JSON 键名是 "as"，但 as 是 Python 关键字，故字段名用 as_text。
+    org: str = ""
+    as_text: str = ""
+    asname: str = ""
 
     def to_dict(self) -> dict:
         return {
             "query": self.query, "status": self.status, "message": self.message,
             "country": self.country, "region": self.region, "city": self.city, "isp": self.isp,
+            "org": self.org, "as": self.as_text, "asname": self.asname,
         }
 
     @classmethod
@@ -245,6 +269,8 @@ class IpInfo:
             message=data.get("message", ""), country=data.get("country", ""),
             region=data.get("regionName") or data.get("region", ""),
             city=data.get("city", ""), isp=data.get("isp", ""),
+            org=data.get("org", ""), as_text=data.get("as", ""),
+            asname=data.get("asname", ""),
         )
 
 
@@ -566,6 +592,47 @@ def collect_block_headers(ws, header_row: int, start_col: int,
         block.append((col, upper))
         col += 1
     return block, col
+
+
+def get_local_public_ip(timeout: int = LOCAL_IP_TIMEOUT) -> str:
+    """
+    探测本机出口公网 IPv4，失败时返回空串。
+
+    云主机（如 AWS EC2）通常无法用自身的公网 IP 回环访问自己：安全组未放行入站、
+    且没有 hairpin NAT，直接 `dig @<自己的公网IP>` 只会超时。探测出本机公网 IP 后，
+    就能把这种 DNS 块改用 127.0.0.1 查询。
+    """
+    for url in LOCAL_IP_URLS:
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            if "fields=query" in url:
+                raw = (resp.json() or {}).get("query", "")
+            else:
+                raw = resp.text
+            ip = normalize_text(raw)
+            if is_ip_address(ip) and ipaddress.ip_address(ip).version == 4:
+                return ip
+        except Exception:           # 网络不可用／返回格式异常时换下一个地址
+            continue
+    return ""
+
+
+def rewrite_local_dns_targets(targets: Sequence[DnsTarget], local_ip: str) -> List[DnsTarget]:
+    """
+    把「DNS 服务器填的是本机自己的公网 IP」的块改成用 127.0.0.1 查询。
+
+    只改 DnsTarget.query_ip（即 `dig @<地址>` 的目标），target.ip 保持原值，
+    因此表格里的 DNS 服务器 IP、缓存键、统计口径都不变。返回被改写的块列表。
+    """
+    changed: List[DnsTarget] = []
+    if not local_ip:
+        return changed
+    for target in targets:
+        if target.ip == local_ip:
+            target.query_ip = LOCAL_DNS_LOOPBACK
+            changed.append(target)
+    return changed
 
 
 def detect_dns_targets(ws, header_row: int, dns_row: int) -> List[DnsTarget]:
@@ -1006,9 +1073,20 @@ class IpInfoClient:
         return {ip: self.cache[ip] for ip in dedupe(ips) if ip in self.cache}
 
 
+def match_operator_code(text) -> Optional[str]:
+    """单段文字：归一化后做包含判断，命中返回 CT / CU / CM，否则返回 None。"""
+    key = re.sub(r"[\s\u3000,，.。;；:：/\\\-_]+", "", normalize_text(text)).lower()
+    if not key:
+        return None
+    for code, keywords in ISP_SIMPLIFY_RULES:
+        if any(keyword in key for keyword in keywords):
+            return code
+    return None
+
+
 def simplify_isp(text) -> str:
     """
-    把 ip-api 返回的运营商文字简化成 CT / CU / CM。
+    把单段运营商文字简化成 CT / CU / CM（保留原有单字段语义）。
 
     规则（不区分大小写；先去掉空白与标点再匹配）：
         含 chinanet / china telecom / wanbao                  -> CT
@@ -1020,11 +1098,30 @@ def simplify_isp(text) -> str:
     raw = normalize_text(text)
     if not raw:
         return UNKNOWN_ISP_TEXT
-    key = re.sub(r"[\s\u3000,，.。;；:：/\\\-_]+", "", raw).lower()
-    for code, keywords in ISP_SIMPLIFY_RULES:
-        if any(keyword in key for keyword in keywords):
+    return match_operator_code(raw) or raw
+
+
+# 判定运营商时依次查看这四个字段，取第一个命中的
+ISP_MATCH_FIELDS: Tuple[str, ...] = ("isp", "org", "as_text", "asname")
+
+
+def simplify_isp_info(info: "IpInfo") -> str:
+    """
+    按 ip-api 的整条记录判定运营商：isp / org / as / asname 四个字段里
+    任意一个命中关键字就简化为 CT / CU / CM（按 ISP_MATCH_FIELDS 的顺序取第一个命中的）。
+
+    四个字段都没命中时，仍然按原规则把 `isp` 原文写进「IP归属」。
+
+    之所以要看四个字段：ip-api 的 `isp` 字段偶发脏值，会把城市名当运营商返回
+    （实测如 "Jinan, " / "Qingdao, "），但同一条响应里的
+    `org`（"Chinanet SD"）与 `as` / `asname`
+    （"AS58540 CHINATELECOM SHANDONG JINAN IDC"）是正确的。
+    """
+    for field in ISP_MATCH_FIELDS:
+        code = match_operator_code(getattr(info, field, ""))
+        if code:
             return code
-    return raw
+    return simplify_isp(info.isp)
 
 
 def ip_attr_text(ip: str, infos: Dict[str, IpInfo]) -> str:
@@ -1032,7 +1129,7 @@ def ip_attr_text(ip: str, infos: Dict[str, IpInfo]) -> str:
     info = infos.get(ip)
     if info is None or info.status != "success":
         return UNKNOWN_ISP_TEXT
-    return simplify_isp(info.isp)
+    return simplify_isp_info(info)
 
 
 # ============================== ping 时延 / 丢包测试 ==============================
@@ -1350,7 +1447,11 @@ def run_all_lookups(dig_exe: str, targets: Sequence[DnsTarget],
 
     def work(item: Tuple[str, DnsTarget]) -> Tuple[str, DigResult, DnsTarget]:
         domain, target = item
-        return domain, run_dig(dig_exe, target.ip, to_ascii_domain(domain)), target
+        # 查询用 resolver_address（本机公网 IP 的块会被改写成 127.0.0.1），
+        # 但结果里的 dns_ip 仍记为表格中的 IP，缓存键与进度显示因此保持不变。
+        res = run_dig(dig_exe, target.resolver_address, to_ascii_domain(domain))
+        res.dns_ip = target.ip
+        return domain, res, target
 
     try:
         if workers <= 1 or total <= 1:
@@ -1408,13 +1509,18 @@ def count_wrapped_lines(value: Any, col_width: Optional[float]) -> int:
     return max(1, lines)
 
 
-def autofit_row_heights(ws, rows: Iterable[int], cols: Iterable[int]) -> int:
+def autofit_row_heights(ws, rows: Iterable[int], cols: Iterable[int],
+                        explicit_only_cols: Iterable[int] = ()) -> int:
     """
     按内容自动设置行高，保证换行/多行的单元格不用手工调整就能完整显示。
 
     行高 = 这些列里需要的最多行数 × 单行高度 + 少量留白，并限制在 Excel 允许的范围内。
+
+    explicit_only_cols 里的列（「IP归属」「首IP归属」）只按单元格里的**显式换行**计数，
+    不按列宽折算：这样很长的运营商文字不会把行高撞高（列宽也保持不变）。
     返回实际调整过的行数。
     """
+    explicit_only = set(explicit_only_cols)
     columns = list(cols)
     widths: Dict[int, Optional[float]] = {}
     for col in columns:
@@ -1428,7 +1534,12 @@ def autofit_row_heights(ws, rows: Iterable[int], cols: Iterable[int]) -> int:
             value = ws.cell(row=row, column=col).value
             if value is None or not str(value).strip():
                 continue
-            needed = max(needed, count_wrapped_lines(value, widths[col]))
+            if col in explicit_only:
+                # 归属类列：只数显式换行的行数，长文字不撑高行高
+                line_count = max(1, len(str(value).splitlines()))
+            else:
+                line_count = count_wrapped_lines(value, widths[col])
+            needed = max(needed, line_count)
         height = min(MAX_ROW_HEIGHT,
                      max(MIN_ROW_HEIGHT, needed * ROW_HEIGHT_PER_LINE + ROW_HEIGHT_PADDING))
         current = ws.row_dimensions[row].height
@@ -1436,6 +1547,202 @@ def autofit_row_heights(ws, rows: Iterable[int], cols: Iterable[int]) -> int:
             ws.row_dimensions[row].height = height
             changed += 1
     return changed
+
+
+def plan_row_split(targets: Sequence[DnsTarget],
+                   domains: Sequence[Tuple[int, str]],
+                   results: Dict[Tuple[int, str], DigResult]) -> Dict[int, int]:
+    """
+    规划「每个 IP 一行」的拆行数。
+
+    每个域名占 N 行，N = 各 DNS 块里解析出的 IP 数的**最大值**（至少 1）。
+    三个块共用同一批行，块与块之间 IP 数不同时只能按最大值对齐，
+    IP 少的那个块后面的格子留空。全部块都没解析出 IP 时保留 1 行。
+    返回 {原始行号: N}。
+    """
+    plan: Dict[int, int] = {}
+    for row, _domain in domains:
+        count = 1
+        for target in targets:
+            res = results.get((row, target.ip))
+            if res is not None and res.ips:
+                count = max(count, len(res.ips))
+        plan[row] = count
+    return plan
+
+
+def insert_split_rows(ws, plan: Dict[int, int]) -> Dict[int, int]:
+    """
+    按拆行规划插入补足行，返回 {原始行号: 拆行后的首行行号}。
+
+    从下往上插入（插入只会影响插入点以下的行），这样上面还没处理的域名行号不会错位；
+    最终首行行号 = 原始行号 + 上方所有域名多出来的行数。
+    """
+    for row in sorted(plan, reverse=True):
+        extra = plan[row] - 1
+        if extra > 0:
+            ws.insert_rows(row + 1, extra)
+
+    starts: Dict[int, int] = {}
+    offset = 0
+    for row in sorted(plan):
+        starts[row] = row + offset
+        offset += plan[row] - 1
+    return starts
+
+
+def write_results_split(ws, targets: Sequence[DnsTarget],
+                        domains: Sequence[Tuple[int, str]],
+                        results: Dict[Tuple[int, str], DigResult],
+                        infos: Dict[str, IpInfo],
+                        pings: Dict[str, PingResult],
+                        improve_pair: Tuple[Optional[DnsTarget], Optional[DnsTarget]],
+                        with_ip_info: bool = True,
+                        with_ping: bool = True,
+                        autofit: bool = True) -> Dict[str, int]:
+    """
+    「每个 IP 一行」的写入方式（--split-ip-rows）。
+
+    每个域名占 N 行（N 见 plan_row_split）：
+    - **每域一列**（前置的序号/域名等列、CNAME、首IP归属、时延改善、丢包改善）
+      纵向合并成一块，值写在合并区首行；
+    - **每个 IP 一列**（A / IP归属 / 时延 / 丢包率）逐行写入，行数不足时留空。
+
+    这样每个格子里只有一个 IP 的归属文字，不靠换行对齐，行高也不会被长文字撞高。
+    """
+    stats = {"cname_cells": 0, "a_cells": 0, "attr_cells": 0, "latency_cells": 0,
+             "loss_cells": 0, "improve_cells": 0, "skipped": 0, "total": 0,
+             "autofit_rows": 0, "extra_rows": 0}
+    wrap_top = Alignment(wrap_text=True, vertical="top")
+    # 拆行后归属类列每格只有一个值（没有显式换行），所以关掉自动换行：
+    # 长文字保持原列宽、超出部分被裁切，也不会把行高撞高。
+    nowrap_top = Alignment(wrap_text=False, vertical="top")
+    improve_target, public_target = improve_pair
+    can_improve = improve_target is not None and public_target is not None
+
+    # 前置列（序号/域名等）= 第一个块之前的所有列，属于「每域一列」
+    lead_cols = list(range(1, min(target.cname_col for target in targets)))
+    per_domain_cols = set(lead_cols)
+    per_ip_cols = set()
+    for target in targets:
+        per_domain_cols.update(
+            c for c in (target.cname_col, target.first_ip_attr_col,
+                        target.latency_improve_col, target.loss_improve_col) if c)
+        per_ip_cols.update(
+            c for c in (target.a_col, target.ip_attr_col, target.latency_col,
+                        target.loss_col) if c)
+    attr_cols = {c for target in targets
+                 for c in (target.ip_attr_col, target.first_ip_attr_col) if c}
+    all_cols = per_domain_cols | per_ip_cols
+
+    plan = plan_row_split(targets, domains, results)
+    starts = insert_split_rows(ws, plan)
+    stats["extra_rows"] = sum(plan.values()) - len(plan)
+
+    widths: Dict[int, Optional[float]] = {}
+    for col in all_cols:
+        dimension = ws.column_dimensions.get(get_column_letter(col))
+        widths[col] = dimension.width if dimension is not None else None
+
+    for row, _domain in domains:
+        start, count = starts[row], plan[row]
+        end = start + count - 1
+
+        # 前置列原有内容（序号/域名等）先留存，清空后再写到合并区首行
+        lead_values = {col: ws.cell(row=start, column=col).value for col in lead_cols}
+        for r in range(start, end + 1):
+            for col in all_cols:
+                ws.cell(row=r, column=col).value = None
+
+        # ---------- 每域一列：值写首行 + 纵向合并 ----------
+        scalar_values: Dict[int, Any] = {}
+        for target in targets:
+            res = results.get((row, target.ip))
+            if target.cname_col and res is not None and res.cnames:
+                scalar_values[target.cname_col] = "\n".join(res.cnames)
+                stats["cname_cells"] += 1
+            if target.first_ip_attr_col and with_ip_info and res is not None and res.ips:
+                scalar_values[target.first_ip_attr_col] = ip_attr_text(res.ips[0], infos) or None
+        if can_improve:
+            latency, loss = compute_improvement(row, improve_target, public_target,
+                                                results, infos, pings)
+            if improve_target.latency_improve_col:
+                scalar_values[improve_target.latency_improve_col] = latency
+                if latency is not None:
+                    stats["improve_cells"] += 1
+            if improve_target.loss_improve_col:
+                scalar_values[improve_target.loss_improve_col] = loss
+
+        for col in per_domain_cols:
+            value = lead_values.get(col) if col in lead_values else scalar_values.get(col)
+            ws.cell(row=start, column=col).value = value
+            if count > 1:
+                ws.merge_cells(start_row=start, start_column=col,
+                               end_row=end, end_column=col)
+
+        # ---------- 每个 IP 一列：逐行写入 ----------
+        for target in targets:
+            stats["total"] += 1
+            res = results.get((row, target.ip))
+            ips = list(res.ips) if res is not None and res.ips else []
+            if not ips:
+                stats["skipped"] += 1
+                continue
+            stats["a_cells"] += 1
+            for index, ip in enumerate(ips[:count]):
+                target_row = start + index
+                ws.cell(row=target_row, column=target.a_col).value = ip
+                if with_ip_info and target.ip_attr_col:
+                    ws.cell(row=target_row, column=target.ip_attr_col).value = \
+                        ip_attr_text(ip, infos) or None
+                    stats["attr_cells"] += 1
+                if with_ping and target.latency_col:
+                    ws.cell(row=target_row, column=target.latency_col).value = \
+                        ping_latency_text(pings.get(ip)) or None
+                    stats["latency_cells"] += 1
+                if with_ping and target.loss_col:
+                    ws.cell(row=target_row, column=target.loss_col).value = \
+                        ping_loss_text(pings.get(ip)) or None
+                    stats["loss_cells"] += 1
+
+        # ---------- 对齐 ----------
+        for r in range(start, end + 1):
+            for col in all_cols:
+                ws.cell(row=r, column=col).alignment = (
+                    nowrap_top if col in attr_cols else wrap_top)
+
+    if autofit:
+        changed = 0
+        for row, _domain in domains:
+            start, count = starts[row], plan[row]
+            # 合并块里的内容（如 CNAME）按它跨的行数摊到每一行
+            merged_lines = 1
+            for col in per_domain_cols:
+                value = ws.cell(row=start, column=col).value
+                if value is None or not str(value).strip():
+                    continue
+                merged_lines = max(merged_lines, count_wrapped_lines(value, widths[col]))
+            base = max(1, math.ceil(merged_lines / count))
+            for index in range(count):
+                needed = base
+                for col in per_ip_cols:
+                    value = ws.cell(row=start + index, column=col).value
+                    if value is None or not str(value).strip():
+                        continue
+                    if col in attr_cols:
+                        line_count = max(1, len(str(value).splitlines()))
+                    else:
+                        line_count = count_wrapped_lines(value, widths[col])
+                    needed = max(needed, line_count)
+                height = min(MAX_ROW_HEIGHT,
+                             max(MIN_ROW_HEIGHT,
+                                 needed * ROW_HEIGHT_PER_LINE + ROW_HEIGHT_PADDING))
+                current = ws.row_dimensions[start + index].height
+                if current is None or abs(current - height) > 0.5:
+                    ws.row_dimensions[start + index].height = height
+                    changed += 1
+        stats["autofit_rows"] = changed
+    return stats
 
 
 def write_results(ws, targets: Sequence[DnsTarget],
@@ -1446,7 +1753,8 @@ def write_results(ws, targets: Sequence[DnsTarget],
                   improve_pair: Tuple[Optional[DnsTarget], Optional[DnsTarget]],
                   with_ip_info: bool = True,
                   with_ping: bool = True,
-                  autofit: bool = True) -> Dict[str, int]:
+                  autofit: bool = True,
+                  split_by_ip: bool = False) -> Dict[str, int]:
     """
     把 dig / 归属 / ping 结果写入数据区，返回统计信息。
 
@@ -1454,12 +1762,22 @@ def write_results(ws, targets: Sequence[DnsTarget],
     - IP归属 / 时延 / 丢包率：与 A 列逐行对应；
     - 首IP归属：dig 结果里第一个 IP 的简化归属；
     - 时延改善 / 丢包改善：仅改善对比块，且该行首IP归属为 CM 时才写；
-    - autofit=True 时还会按内容自动设置行高。
+    - autofit=True 时还会按内容自动设置行高；
+    - split_by_ip=True 时改走「每个 IP 一行」的 write_results_split()。
     """
+    if split_by_ip:
+        return write_results_split(ws, targets, domains, results, infos, pings,
+                                   improve_pair, with_ip_info, with_ping, autofit)
+
     stats = {"cname_cells": 0, "a_cells": 0, "attr_cells": 0, "latency_cells": 0,
              "loss_cells": 0, "improve_cells": 0, "skipped": 0, "total": 0,
              "autofit_rows": 0}
     wrap_top = Alignment(wrap_text=True, vertical="top")
+    # 注意：「IP归属」「首IP归属」每个 IP 占一行，靠的是单元格里的**显式换行符**，
+    # 而 Excel 只有在「自动换行」开启时才会把换行符渲染成多行（关掉会拼成一行，
+    # 如 CU\nCU\nCU\nCU 变成 CUCUCUCU），所以这里必须保持 wrap_text=True。
+    # 它们只在行高估算里被特殊对待（只按显式换行计数，长文字不撞高行高，
+    # 见 autofit_row_heights 的 explicit_only_cols）。
     improve_target, public_target = improve_pair
     can_improve = improve_target is not None and public_target is not None
 
@@ -1516,7 +1834,11 @@ def write_results(ws, targets: Sequence[DnsTarget],
 
     if autofit:
         columns = sorted({col for target in targets for col in target.managed_cols})
-        stats["autofit_rows"] = autofit_row_heights(ws, [row for row, _ in domains], columns)
+        # 归属类列只按显式换行参与行高估算（长文字不撞高行高）
+        explicit_only = {c for target in targets
+                         for c in (target.ip_attr_col, target.first_ip_attr_col) if c}
+        stats["autofit_rows"] = autofit_row_heights(
+            ws, [row for row, _ in domains], columns, explicit_only_cols=explicit_only)
 
     return stats
 
@@ -1682,6 +2004,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="丢包率不为 0%% 时不重测（默认会重测一次并按第二次结果记录）")
     parser.add_argument("--no-autofit-row-height", action="store_true",
                         help="不按内容自动调整行高（默认会自动调整）")
+    parser.add_argument("--split-ip-rows", dest="split_ip_rows", action="store_true",
+                        default=True,
+                        help="每个 IP 占一行：解析出多个 IP 时按 IP 数拆行，"
+                             "CNAME/首IP归属/改善列等「每域一列」的内容纵向合并"
+                             "（默认开启）")
+    parser.add_argument("--no-split-ip-rows", dest="split_ip_rows", action="store_false",
+                        help="关闭「每个 IP 一行」，恢复成一个域名一行"
+                             "（每格多行、靠换行对齐）")
+    parser.add_argument("--no-local-dns-rewrite", action="store_true",
+                        help="不把「DNS 块填的是本机公网 IP」自动改写成 127.0.0.1 查询"
+                             "（默认会自动改写）")
+    parser.add_argument("--local-ip", default=None,
+                        help="手动指定本机出口公网 IP（跳过自动探测）")
     parser.add_argument("--keep-duplicates", action="store_true",
                         help="保留表中的重复域名行（默认自动删除多余行并备份）")
     parser.add_argument("--force-stats", action="store_true",
@@ -1781,6 +2116,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"[信息] 表尾统计项：{len(layout.stats_slots)} 个"
           + ("" if write_stats else "（--limit 试跑：默认不写统计，可加 --force-stats 强制写入）"))
 
+    # DNS 块填的是本机自己的公网 IP 时，实际改用 127.0.0.1 查询（表格里的 IP 不变）
+    if args.no_local_dns_rewrite:
+        print("[信息] 已按参数关闭「DNS 块等于本机公网 IP 时改用 127.0.0.1 查询」的处理。")
+    else:
+        local_ip = args.local_ip or get_local_public_ip()
+        if not local_ip:
+            print("[警告] 无法探测本机出口公网 IP，跳过「改用 127.0.0.1 查询」的处理"
+                  "（可用 --local-ip <IP> 手动指定）。")
+        else:
+            print(f"[信息] 本机出口公网 IP：{local_ip}")
+            swapped = rewrite_local_dns_targets(layout.targets, local_ip)
+            if swapped:
+                for target in swapped:
+                    print(f"[信息] DNS 块 {target.label} 用的 {target.ip} 就是本机公网 IP，"
+                          f"实际改用 {LOCAL_DNS_LOOPBACK} 查询；"
+                          f"结果表里的 DNS 服务器 IP 仍保留为 {target.ip}")
+            else:
+                print("[信息] 没有 DNS 块使用本机公网 IP，无需改写查询地址。")
+
     if not domains:
         print("[警告] 没有读取到任何域名，程序结束。")
         return 0
@@ -1831,7 +2185,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stats = write_results(ws, layout.targets, domains, results, infos, pings,
                           (layout.improve_target, layout.public_target),
                           with_ip_info=not args.no_ip_info, with_ping=bool(ping_exe),
-                          autofit=not args.no_autofit_row_height)
+                          autofit=not args.no_autofit_row_height,
+                          split_by_ip=args.split_ip_rows)
+    if stats.get("extra_rows"):
+        # 拆行会把表尾统计区整体下移，而 write_statistics() 依赖 target 对象身份，
+        # 不能重新探测布局，只能把统计槽位的行号偏移过去。
+        layout.stats_slots = [replace(slot, row=slot.row + stats["extra_rows"])
+                              for slot in layout.stats_slots]
+        print(f"[信息] 已按「每个 IP 一行」插入 {stats['extra_rows']} 行"
+              f"（{len(domains)} 个域名 -> {len(domains) + stats['extra_rows']} 行）；"
+              f"表尾统计区已同步下移")
     print(f"[信息] 结果统计：写入 CNAME {stats['cname_cells']} 个、A {stats['a_cells']} 个、"
           f"IP归属 {stats['attr_cells']} 个、时延 {stats['latency_cells']} 个、"
           f"丢包率 {stats['loss_cells']} 个、改善 {stats['improve_cells']} 个；"

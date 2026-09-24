@@ -4,6 +4,8 @@
 运行：
     python -m unittest discover -s tests -v
 """
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -17,6 +19,7 @@ import domain_dns_test as app  # noqa: E402
 from openpyxl import Workbook, load_workbook  # noqa: E402
 
 REAL_XLSX = app.DEFAULT_INPUT
+RESULT_XLSX = app.build_output_path(REAL_XLSX)
 
 # 真实的 dig +short 输出样例（www.cisco.com @8.8.8.8）
 SAMPLE_DIG_OUTPUT = """www.cisco.com.edgekey.net.
@@ -700,17 +703,44 @@ class TestSyntheticWorkbook(unittest.TestCase):
         stats = app.write_results(ws, layout.targets, domains, results, infos, pings,
                                   (layout.improve_target, layout.public_target))
         self.assertGreater(stats["autofit_rows"], 0)
+        # 「IP归属」「首IP归属」只按显式换行参与行高估算（长文字不撑高行高）
+        explicit_cols = {c for t in layout.targets
+                         for c in (t.ip_attr_col, t.first_ip_attr_col) if c}
         columns = sorted({col for target in layout.targets for col in target.managed_cols})
         for row, _domain in domains:
             height = ws.row_dimensions[row].height
             self.assertIsNotNone(height)
             for col in columns:
-                dimension = ws.column_dimensions.get(app.get_column_letter(col))
-                lines = app.count_wrapped_lines(
-                    ws.cell(row=row, column=col).value,
-                    dimension.width if dimension is not None else None)
+                value = ws.cell(row=row, column=col).value
+                if col in explicit_cols:
+                    lines = max(1, len(str(value or "").splitlines()))
+                else:
+                    dimension = ws.column_dimensions.get(app.get_column_letter(col))
+                    lines = app.count_wrapped_lines(
+                        value, dimension.width if dimension is not None else None)
                 self.assertGreaterEqual(height, lines * app.ROW_HEIGHT_PER_LINE,
                                         f"第{row}行第{col}列内容可能显示不全")
+
+    def test_attribution_keeps_one_line_per_ip(self):
+        """「IP归属」每个 IP 占一行：必须保持自动换行，否则 Excel 会把换行拼成一行。"""
+        ws, layout, domains = self._prepare()
+        results, infos, pings = self._fixtures()
+        app.write_results(ws, layout.targets, domains, results, infos, pings,
+                          (layout.improve_target, layout.public_target))
+        checked = 0
+        for row, _domain in domains:
+            for target in layout.targets:
+                cell = ws.cell(row=row, column=target.ip_attr_col)
+                res = results.get((row, target.ip))
+                if cell.value is None or res is None or not res.ips:
+                    continue          # 无解析结果的行不写入、也不设对齐
+                checked += 1
+                # 自动换行必须开着，否则 CU\nCU\nCU\nCU 会显示成 CUCUCUCU
+                self.assertIs(cell.alignment.wrap_text, True,
+                              f"第{row}行第{target.ip_attr_col}列应保持自动换行")
+                self.assertEqual(len(str(cell.value).splitlines()), len(res.ips),
+                                 f"第{row}行 IP归属 行数应与该块的 IP 数一致")
+        self.assertGreater(checked, 0)
 
     def test_statistics_cells_are_cleared_then_written(self):
         ws, layout, domains = self._prepare()
@@ -774,6 +804,29 @@ class TestRowHeightAutofit(unittest.TestCase):
         self.assertGreaterEqual(ws.row_dimensions[1].height, app.MIN_ROW_HEIGHT)
         self.assertLess(ws.row_dimensions[1].height, 200)
 
+    def test_autofit_explicit_only_columns(self):
+        """explicit_only_cols 里的列只按显式换行计数，长文本不撑高行高。"""
+        wb = Workbook()
+        ws = wb.active
+        ws.column_dimensions["A"].width = 10
+        long_text = "L" * 200                      # 在 10 宽列里会折成很多行
+        ws["A1"] = long_text
+        wrapped = app.count_wrapped_lines(long_text, 10)
+        self.assertGreater(wrapped, 1)
+
+        app.autofit_row_heights(ws, [1], [1])      # 不指定：按折行算
+        self.assertGreaterEqual(ws.row_dimensions[1].height,
+                                wrapped * app.ROW_HEIGHT_PER_LINE)
+
+        app.autofit_row_heights(ws, [1], [1], explicit_only_cols=[1])
+        self.assertAlmostEqual(ws.row_dimensions[1].height,
+                               app.ROW_HEIGHT_PER_LINE + app.ROW_HEIGHT_PADDING)
+
+        ws["A1"] = "\n".join(["x"] * 5)            # 多行仍按显式行数算
+        app.autofit_row_heights(ws, [1], [1], explicit_only_cols=[1])
+        self.assertAlmostEqual(ws.row_dimensions[1].height,
+                               5 * app.ROW_HEIGHT_PER_LINE + app.ROW_HEIGHT_PADDING)
+
     def test_autofit_respects_excel_max_height(self):
         wb = Workbook()
         ws = wb.active
@@ -781,6 +834,184 @@ class TestRowHeightAutofit(unittest.TestCase):
         ws["A1"] = "\n".join(["x"] * 200)
         app.autofit_row_heights(ws, [1], [1])
         self.assertEqual(ws.row_dimensions[1].height, app.MAX_ROW_HEIGHT)
+
+
+class TestLocalDnsRewrite(unittest.TestCase):
+    """DNS 块填的是本机公网 IP 时，查询改用 127.0.0.1，但表格里的 IP 保持原样。"""
+
+    @staticmethod
+    def _target(ip):
+        return app.DnsTarget(ip=ip, cname_col=4, a_col=5, ip_attr_col=6)
+
+    def test_resolver_address_defaults_to_block_ip(self):
+        target = self._target("8.8.8.8")
+        self.assertEqual(target.resolver_address, "8.8.8.8")
+        self.assertEqual(target.query_ip, "")
+
+    def test_matching_local_ip_is_rewritten_to_loopback(self):
+        local, other = self._target("203.0.113.9"), self._target("8.8.8.8")
+        changed = app.rewrite_local_dns_targets([local, other], "203.0.113.9")
+        self.assertEqual(changed, [local])
+        self.assertEqual(local.resolver_address, app.LOCAL_DNS_LOOPBACK)
+        self.assertEqual(local.ip, "203.0.113.9")       # 表格里的 IP 保持不变
+        self.assertEqual(other.resolver_address, "8.8.8.8")
+
+    def test_no_rewrite_when_ip_not_matching_or_unknown(self):
+        target = self._target("203.0.113.9")
+        self.assertEqual(app.rewrite_local_dns_targets([target], ""), [])
+        self.assertEqual(app.rewrite_local_dns_targets([target], "198.51.100.7"), [])
+        self.assertEqual(target.resolver_address, "203.0.113.9")
+
+    def test_get_local_public_ip_accepts_v4_and_rejects_garbage(self):
+        class FakeResp:
+            def __init__(self, text="", payload=None):
+                self.text, self._payload = text, payload or {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        with mock.patch.object(app.requests, "get",
+                              return_value=FakeResp(payload={"query": "203.0.113.9"})):
+            self.assertEqual(app.get_local_public_ip(), "203.0.113.9")
+
+        with mock.patch.object(app.requests, "get",
+                              return_value=FakeResp(text="not-an-ip\n")):
+            self.assertEqual(app.get_local_public_ip(), "")
+
+        with mock.patch.object(app.requests, "get", side_effect=OSError("boom")):
+            self.assertEqual(app.get_local_public_ip(), "")
+
+
+class TestSplitIpRows(unittest.TestCase):
+    """--split-ip-rows：每个 IP 一行，每域一列纵向合并。"""
+
+    TARGETS = [
+        app.DnsTarget(ip="8.8.8.8", cname_col=4, a_col=5, ip_attr_col=6,
+                      latency_col=7, loss_col=8, first_ip_attr_col=9),
+        app.DnsTarget(ip="1.1.1.1", cname_col=10, a_col=11, ip_attr_col=12,
+                      latency_col=13, loss_col=14, first_ip_attr_col=15),
+    ]
+
+    def test_plan_row_split_uses_max_ip_count(self):
+        domains = [(7, "a.com"), (8, "b.com"), (9, "c.com")]
+        results = {
+            (7, "8.8.8.8"): app.DigResult("a.com", "8.8.8.8",
+                                           ips=["1.1.1.1", "2.2.2.2", "3.3.3.3"]),
+            (7, "1.1.1.1"): app.DigResult("a.com", "1.1.1.1", ips=["4.4.4.4"]),
+            (8, "8.8.8.8"): app.DigResult("b.com", "8.8.8.8", ips=[]),
+            (8, "1.1.1.1"): app.DigResult("b.com", "1.1.1.1",
+                                           ips=["5.5.5.5", "6.6.6.6"]),
+            (9, "8.8.8.8"): app.DigResult("c.com", "8.8.8.8", ips=["7.7.7.7"]),
+        }
+        # 取各块 IP 数的最大值；全部无解析时保留 1 行
+        self.assertEqual(app.plan_row_split(self.TARGETS, domains, results),
+                         {7: 3, 8: 2, 9: 1})
+
+    def test_insert_split_rows_computes_new_start_rows(self):
+        wb = Workbook()
+        ws = wb.active
+        for row in range(1, 11):
+            ws.cell(row=row, column=1).value = f"v{row}"
+        starts = app.insert_split_rows(ws, {3: 3, 5: 1, 7: 2})
+        self.assertEqual(starts, {3: 3, 5: 7, 7: 9})
+        self.assertEqual(ws["A3"].value, "v3")
+        self.assertIsNone(ws["A4"].value)         # 新插入的空行
+        self.assertEqual(ws["A7"].value, "v5")    # 原第 5 行被推后
+        self.assertEqual(ws["A11"].value, "v8")
+
+    def test_write_results_split_merges_per_domain_columns(self):
+        wb = Workbook()
+        ws = wb.active
+        ws["A7"], ws["B7"], ws["C7"] = 1, "CTM", "a.example.com"
+        ws["A8"], ws["B8"], ws["C8"] = 2, "CTM", "b.example.com"
+        results = {
+            (7, "8.8.8.8"): app.DigResult("a.example.com", "8.8.8.8",
+                                           cnames=["a.cdn.net"],
+                                           ips=["1.1.1.1", "2.2.2.2", "3.3.3.3"]),
+            (7, "1.1.1.1"): app.DigResult("a.example.com", "1.1.1.1", ips=["9.9.9.9"]),
+            (8, "8.8.8.8"): app.DigResult("b.example.com", "8.8.8.8", ips=["4.4.4.4"]),
+            (8, "1.1.1.1"): app.DigResult("b.example.com", "1.1.1.1", ips=[]),
+        }
+        infos = {ip: app.IpInfo(ip, "success", isp="Chinanet")
+                 for ip in ("1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4", "9.9.9.9")}
+        pings = {ip: app.PingResult(ip, avg_ms=20, loss_percent=0) for ip in infos}
+        app.write_results_split(ws, self.TARGETS,
+                                [(7, "a.example.com"), (8, "b.example.com")],
+                                results, infos, pings, (None, None))
+
+        # 第一个域名有 3 个 IP -> 占 7~9 行；第二个域名 1 个 IP -> 占第 10 行
+        self.assertEqual([ws.cell(row=r, column=5).value for r in (7, 8, 9)],
+                         ["1.1.1.1", "2.2.2.2", "3.3.3.3"])
+        self.assertEqual(ws["E10"].value, "4.4.4.4")
+        # 每个 IP 一个归属，与 A 列逐行对应
+        self.assertEqual([ws.cell(row=r, column=6).value for r in (7, 8, 9)],
+                         ["CT", "CT", "CT"])
+        # IP 少的块后面留空
+        self.assertEqual(ws["K7"].value, "9.9.9.9")
+        self.assertIsNone(ws["K8"].value)
+        self.assertIsNone(ws["K9"].value)
+        # 每域一列：纵向合并，值只在首行
+        merged = {str(m) for m in ws.merged_cells.ranges}
+        for rng in ("A7:A9", "B7:B9", "C7:C9", "D7:D9", "I7:I9", "J7:J9", "O7:O9"):
+            self.assertIn(rng, merged)
+        self.assertEqual(ws["D7"].value, "a.cdn.net")
+        self.assertEqual(ws["A7"].value, 1)
+        self.assertIsNone(ws["D8"].value)
+        # 每 IP 一列不合并
+        self.assertNotIn("E7:E9", merged)
+        # 序号/域名随插入行一起下移，第二个域名落到第 10 行
+        self.assertEqual(ws["A10"].value, 2)
+        self.assertEqual(ws["C10"].value, "b.example.com")
+        # 归属列不换行（每格只有一个值），A/CNAME 保持换行
+        self.assertIs(ws["F7"].alignment.wrap_text, False)
+        self.assertIs(ws["D7"].alignment.wrap_text, True)
+        self.assertIs(ws["E7"].alignment.wrap_text, True)
+
+
+class TestVerifyResultScript(unittest.TestCase):
+    """tests/verify_result.py 的域名块分组：兼容拆行与一个域名一行两种格式。"""
+
+    @staticmethod
+    def _sheet(rows):
+        wb = Workbook()
+        ws = wb.active
+        for row, domain in rows:
+            if domain:
+                ws.cell(row=row, column=3).value = domain
+        return ws
+
+    def test_groups_split_rows_and_marks_processed(self):
+        import verify_result as vr
+        # 拆行格式：域名列只在块首行有值，一个域名占多行
+        ws = self._sheet([(7, "a.com"), (10, "b.com"), (12, "c.com")])
+        ws["E7"], ws["E10"] = "1.1.1.1", "2.2.2.2"
+        blocks = vr.group_domain_blocks(ws, 3, 7, 13, [5, 6])
+        self.assertEqual(blocks, [(7, 9, "a.com", True),
+                                  (10, 11, "b.com", True),
+                                  (12, 13, "c.com", False)])
+
+    def test_groups_single_row_format(self):
+        import verify_result as vr
+        # 一个域名一行：每个域名行自己就是一个块
+        ws = self._sheet([(7, "a.com"), (8, "b.com"), (9, "c.com")])
+        ws["E7"] = "1.1.1.1\n2.2.2.2"
+        blocks = vr.group_domain_blocks(ws, 3, 7, 9, [5, 6])
+        self.assertEqual(blocks, [(7, 7, "a.com", True),
+                                  (8, 8, "b.com", False),
+                                  (9, 9, "c.com", False)])
+
+    def test_verifier_accepts_generated_result_file(self):
+        """对真实生成的结果文件跑一遍校验脚本（文件不存在就跳过）。"""
+        if not RESULT_XLSX.exists():
+            self.skipTest(f"缺少结果文件 {RESULT_XLSX}（先跑一次程序）")
+        import verify_result as vr
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = vr.main(str(RESULT_XLSX))
+        self.assertEqual(code, 0, buffer.getvalue()[-2000:])
 
 
 class TestStatistics(unittest.TestCase):
@@ -1027,6 +1258,12 @@ class TestCliArgs(unittest.TestCase):
         self.assertFalse(args.dry_run)
         self.assertFalse(args.inplace)
         self.assertIsNone(args.limit)
+        self.assertTrue(args.split_ip_rows)        # 拆行默认开启
+
+    def test_split_ip_rows_can_be_disabled(self):
+        self.assertTrue(app.parse_args([]).split_ip_rows)
+        self.assertFalse(app.parse_args(["--no-split-ip-rows"]).split_ip_rows)
+        self.assertTrue(app.parse_args(["--split-ip-rows"]).split_ip_rows)
 
     def test_limit_and_output(self):
         args = app.parse_args(["--limit", "5", "--output", "out.xlsx", "--workers", "2"])
