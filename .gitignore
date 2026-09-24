@@ -1,0 +1,19 @@
+# ---------- 本机缓存 / 运行产物（写死了本机绝对路径，不要提交） ----------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+cache/
+backup/
+run_log.txt
+
+# 运行后自动生成的带结果文件（输入表本身不在此列）
+*_result.xlsx
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.zhanlu/
+.DS_Store
+Thumbs.db

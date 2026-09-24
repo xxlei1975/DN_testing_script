@@ -1,0 +1,15 @@
+# 统一换行符，避免 Windows 检出时把 shell 脚本改成 CRLF 导致 Linux 上无法执行
+* text=auto eol=lf
+
+# Windows 专用脚本保持 CRLF（记事本 / cmd.exe 友好）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制文件不要做换行转换
+*.xlsx binary
+*.whl binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
